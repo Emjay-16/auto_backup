@@ -1,0 +1,184 @@
+.page {
+  display: grid;
+  gap: 16px;
+  padding: 0 28px 28px;
+}
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: #ffffff;
+  width: fit-content;
+  max-width: 100%;
+}
+
+.tabs button {
+  --tab-main: var(--muted);
+  --tab-soft: #ffffff;
+  --tab-line: var(--line);
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px;
+  border: 1px solid var(--tab-line);
+  border-radius: 11px;
+  background: var(--tab-soft);
+  color: var(--tab-main);
+  font-size: 13px;
+  font-weight: 760;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.tabs button:hover {
+  background: var(--surface-soft);
+  transform: none;
+}
+
+.tabs button b {
+  min-width: 23px;
+  min-height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+  color: inherit;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.tabs .active {
+  border-color: var(--tab-main);
+  background: color-mix(in srgb, var(--tab-main) 9%, #ffffff);
+  color: var(--tab-main);
+  box-shadow: none;
+}
+
+.tabs .running {
+  --tab-main: var(--primary);
+  --tab-soft: #ffffff;
+  --tab-line: var(--line);
+}
+
+.tabs .pending {
+  --tab-main: #d97706;
+  --tab-soft: #fffbeb;
+  --tab-line: #fde68a;
+}
+
+.tabs .skipped {
+  --tab-main: #6474ad;
+  --tab-soft: #ffffff;
+  --tab-line: var(--line);
+}
+
+.tabs .failed {
+  --tab-main: var(--danger);
+  --tab-soft: #fef2f2;
+  --tab-line: #fecaca;
+}
+
+.tabs .success {
+  --tab-main: var(--success);
+  --tab-soft: #ffffff;
+  --tab-line: var(--line);
+}
+
+.jobs {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.job {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr) 160px auto 48px;
+  align-items: center;
+  gap: 14px;
+  padding: 13px 14px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: #ffffff;
+  color: inherit;
+  box-shadow: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.job:hover {
+  border-color: var(--line-strong);
+  background: var(--surface-soft);
+  box-shadow: none;
+  transform: none;
+}
+
+.job strong {
+  display: block;
+  color: var(--foreground);
+  font-size: 14.5px;
+}
+
+.job span,
+.job time {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job p {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: normal;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.progress {
+  height: 9px;
+  overflow: hidden;
+  border: 1px solid #e2eaf4;
+  border-radius: 999px;
+  background: #edf4fb;
+}
+
+.progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--primary);
+}
+
+.emptyJobs {
+  margin: 0;
+  padding: 34px 20px;
+  border: 1px dashed #c8d7e8;
+  border-radius: 16px;
+  background: #ffffff;
+  color: #64748b;
+  font-size: 13px;
+  font-weight: 760;
+  text-align: center;
+}
+
+@media (max-width: 900px) {
+  .job,
+  .detailGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 780px) {
+  .page {
+    padding: 0 16px 20px;
+  }
+}

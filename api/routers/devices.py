@@ -1,0 +1,735 @@
+import ipaddress
+import os
+import socket
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session, joinedload
+
+from api import constants, schemas
+from api.database import get_db
+from api.errors import api_exception
+from api.models import Device, DeviceGroup
+from api.schemas import (
+    DeviceCreate,
+    DeviceNameResponse,
+    DeviceResponse,
+    DeviceStatusResponse,
+    DeviceUpdate,
+    DeviceBackupPathCreate,
+    DeviceBackupPathResponse,
+    BackupTargetResponse,
+    CustomBackupPathResponse,
+    RemotePathCheckResponse,
+    RemoteFileResponse,
+)
+from api.services.backup_targets import (
+    get_backup_path_label,
+    get_custom_auto_backup_targets,
+    get_device_backup_paths,
+    add_device_backup_path,
+    delete_device_backup_path,
+)
+from api.services.credential_crypto import encrypt_secret
+from api.services.device_resolver import map_device_name
+from api.services.sftp_backup import RemotePathNotFound, list_remote_path
+from api.services.ssh_credentials import require_ssh_credentials
+from api.utils.time import now_local
+
+
+router = APIRouter(
+    prefix="/devices",
+    tags=["Devices"],
+)
+
+
+@router.get("/", response_model=List[DeviceResponse])
+def get_devices(
+    refresh_status: bool = False,
+    db: Session = Depends(get_db),
+):
+    devices = (
+        db.query(Device)
+        .options(joinedload(Device.group))
+        .order_by(Device.device_id)
+        .all()
+    )
+    if refresh_status:
+        _refresh_devices_statuses(devices, db)
+    return [DeviceResponse.from_device(d) for d in devices]
+
+
+@router.get("/name-by-ip/{ip_address}", response_model=DeviceNameResponse)
+def get_device_name_by_ip(ip_address: str):
+    try:
+        parsed_ip = ipaddress.ip_address(ip_address)
+    except ValueError:
+        raise api_exception(
+            400,
+            "INVALID_IP_ADDRESS",
+            "Invalid IP address",
+        )
+
+    device_name = map_device_name(str(parsed_ip))
+    if device_name == str(parsed_ip):
+        raise api_exception(
+            404,
+            "DEVICE_NAME_NOT_MAPPED",
+            "Device name cannot be mapped from this IP",
+        )
+
+    return DeviceNameResponse(device_name=device_name)
+
+
+@router.get("/backup-targets", response_model=List[BackupTargetResponse])
+def get_backup_targets(
+    device_id: Optional[int] = None,
+    category: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    if device_id is not None:
+        device_paths = get_device_backup_paths(db, device_id)
+        device = db.query(Device).filter(Device.device_id == device_id).first()
+        if category == "computer":
+            if not device or not device.group or device.group.group_name.strip().lower() != "computer":
+                return []
+            targets = []
+            for index, target in enumerate(device_paths, start=1):
+                target_type = _backup_target_type_from_path(target.path)
+                targets.append(
+                    BackupTargetResponse(
+                        key=f"device_{device_id}_{index}",
+                        label=target.label,
+                        path=target.path,
+                        target_type=target_type,
+                        browsable=target_type == "directory",
+                        backup_api="file",
+                        removable=True,
+                    )
+                )
+            return targets
+        if device_paths:
+            targets = []
+            for index, target in enumerate(device_paths, start=1):
+                target_type = _backup_target_type_from_path(target.path)
+                targets.append(
+                    BackupTargetResponse(
+                        key=f"device_{device_id}_{index}",
+                        label=target.label,
+                        path=target.path,
+                        target_type=target_type,
+                        browsable=target_type == "directory",
+                        backup_api="file",
+                        removable=True,
+                    )
+                )
+            return targets
+        if category not in (None, "robot"):
+            return []
+
+    targets = []
+    seen_paths = set()
+
+    def append_unique_target(target: BackupTargetResponse):
+        normalized_path = target.path.rstrip("/") or "/"
+        if normalized_path in seen_paths:
+            return
+        seen_paths.add(normalized_path)
+        targets.append(target)
+
+    flow_path = os.getenv("ROBOT_NODE_RED_FLOW_PATH")
+    maps_path = os.getenv("ROBOT_MAPS_PATH")
+    db_name = os.getenv("ROBOT_DB_NAME")
+    db_table = os.getenv("ROBOT_DB_TABLE")
+
+    if flow_path:
+        append_unique_target(
+            BackupTargetResponse(
+                key="flows",
+                label=get_backup_path_label(flow_path, "Node-RED flows"),
+                path=flow_path,
+                target_type="file",
+                browsable=False,
+                backup_api="file",
+            )
+        )
+
+    if maps_path:
+        append_unique_target(
+            BackupTargetResponse(
+                key="maps",
+                label=get_backup_path_label(maps_path, "Maps folder"),
+                path=maps_path,
+                target_type="directory",
+                browsable=True,
+                backup_api="file",
+            )
+        )
+
+    if category != "computer":
+        for index, custom_target in enumerate(get_custom_auto_backup_targets(), start=1):
+            target_type = _backup_target_type_from_path(custom_target.path)
+            append_unique_target(
+                BackupTargetResponse(
+                    key=f"custom_{index}",
+                    label=custom_target.label,
+                    path=custom_target.path,
+                    target_type=target_type,
+                    browsable=target_type == "directory",
+                    backup_api="file",
+                    removable=True,
+                )
+            )
+
+    if db_name and db_table:
+        database_path = f"{db_name}.{db_table}"
+        append_unique_target(
+            BackupTargetResponse(
+                key="robot_db",
+                label=get_backup_path_label(database_path, f"{db_name}.{db_table} -> JSON"),
+                path=database_path,
+                target_type="database",
+                browsable=False,
+                backup_api="robot_db",
+            )
+        )
+
+    return targets
+
+
+@router.get("/{device_id}/status", response_model=DeviceStatusResponse)
+def check_device_status(
+    device_id: int,
+    db: Session = Depends(get_db),
+):
+    device = (
+        db.query(Device)
+        .filter(Device.device_id == device_id)
+        .first()
+    )
+
+    if not device:
+        raise api_exception(
+            404,
+            "DEVICE_NOT_FOUND",
+            "Device not found",
+        )
+
+    online = _can_connect(device.ip_address, getattr(device, "ssh_port", None))
+    device.device_status = (
+        constants.DEVICE_STATUS_ONLINE
+        if online
+        else constants.DEVICE_STATUS_OFFLINE
+    )
+    if online:
+        device.last_seen_at = now_local()
+    device.updated_at = now_local()
+    db.commit()
+    db.refresh(device)
+
+    return DeviceStatusResponse(
+        device_id=device.device_id,
+        ip_address=device.ip_address,
+        device_name=device.device_name,
+        online=online,
+        device_status=device.device_status,
+        last_seen_at=device.last_seen_at,
+        message="Device is online" if online else "Device is offline",
+    )
+
+
+@router.get("/status-by-ip/{ip_address}", response_model=DeviceStatusResponse)
+def check_device_status_by_ip(ip_address: str):
+    try:
+        parsed_ip = ipaddress.ip_address(ip_address)
+    except ValueError:
+        raise api_exception(
+            400,
+            "INVALID_IP_ADDRESS",
+            "Invalid IP address",
+        )
+
+    ip_text = str(parsed_ip)
+    device_name = map_device_name(ip_text)
+    online = _can_connect(ip_text)
+
+    return DeviceStatusResponse(
+        ip_address=ip_text,
+        device_name=device_name,
+        online=online,
+        device_status=(
+            constants.DEVICE_STATUS_ONLINE
+            if online
+            else constants.DEVICE_STATUS_OFFLINE
+        ),
+        last_seen_at=now_local() if online else None,
+        message="Device is online" if online else "Device is offline",
+    )
+
+
+@router.get("/{device_id}/files", response_model=List[RemoteFileResponse])
+def list_device_files(
+    device_id: int,
+    path: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    device = _get_device_or_404(device_id, db)
+    username, password, port = require_ssh_credentials(device)
+
+    remote_paths = [path] if path else _default_browse_paths(db, device.device_id)
+    if not remote_paths:
+        raise api_exception(
+            400,
+            "REMOTE_PATH_REQUIRED",
+            "path is required when default browse paths are not configured",
+        )
+
+    files = []
+    try:
+        for remote_path in remote_paths:
+            try:
+                files.extend(
+                    list_remote_path(
+                        host=device.ip_address,
+                        username=username,
+                        password=password,
+                        port=port,
+                        remote_path=remote_path,
+                    )
+                )
+            except RemotePathNotFound:
+                if path:
+                    raise
+                continue
+    except RemotePathNotFound as exc:
+        device.device_status = constants.DEVICE_STATUS_ONLINE
+        device.last_seen_at = now_local()
+        device.updated_at = now_local()
+        db.commit()
+        raise api_exception(
+            404,
+            "REMOTE_PATH_NOT_FOUND",
+            f"Remote path not found on {device.device_name}: {exc.remote_path}",
+            detail={
+                "device_id": device.device_id,
+                "device_name": device.device_name,
+                "ip_address": device.ip_address,
+                "remote_path": exc.remote_path,
+            },
+        )
+    except RuntimeError as exc:
+        raise api_exception(
+            500,
+            "SFTP_OPERATION_FAILED",
+            str(exc),
+        )
+    except Exception as exc:
+        device.device_status = constants.DEVICE_STATUS_OFFLINE
+        device.updated_at = now_local()
+        db.commit()
+        raise api_exception(
+            502,
+            "SFTP_LIST_FILES_FAILED",
+            f"SFTP list files failed: {exc}",
+        )
+
+    device.device_status = constants.DEVICE_STATUS_ONLINE
+    device.last_seen_at = now_local()
+    device.updated_at = now_local()
+    db.commit()
+
+    return [
+        schemas.RemoteFileResponse(
+            name=file.name,
+            path=file.path,
+            file_type=file.file_type,
+            size_bytes=file.size_bytes,
+            modified_at=file.modified_at,
+        )
+        for file in files
+    ]
+
+
+@router.get("/{device_id}/path-check", response_model=RemotePathCheckResponse)
+def check_device_remote_path(
+    device_id: int,
+    path: str,
+    db: Session = Depends(get_db),
+):
+    device = _get_device_or_404(device_id, db)
+    username, password, port = require_ssh_credentials(device)
+
+    try:
+        files = list_remote_path(
+            host=device.ip_address,
+            username=username,
+            password=password,
+            port=port,
+            remote_path=path,
+        )
+    except RemotePathNotFound:
+        return RemotePathCheckResponse(
+            device_id=device.device_id,
+            device_name=device.device_name,
+            ip_address=device.ip_address,
+            path=path,
+            exists=False,
+            file_count=0,
+            message="Remote path does not exist for this device",
+        )
+    except RuntimeError as exc:
+        raise api_exception(
+            500,
+            "SFTP_OPERATION_FAILED",
+            str(exc),
+        )
+    except Exception as exc:
+        raise api_exception(
+            502,
+            "SFTP_LIST_FILES_FAILED",
+            f"SFTP list files failed: {exc}",
+            detail={
+                "device_id": device.device_id,
+                "device_name": device.device_name,
+                "ip_address": device.ip_address,
+                "remote_path": path,
+            },
+        )
+
+    return RemotePathCheckResponse(
+        device_id=device.device_id,
+        device_name=device.device_name,
+        ip_address=device.ip_address,
+        path=path,
+        exists=True,
+        file_count=len(files),
+        message="Remote path exists for this device",
+    )
+
+
+@router.get("/{device_id}", response_model=DeviceResponse)
+def get_device(
+    device_id: int,
+    db: Session = Depends(get_db),
+):
+    return _get_device_or_404(device_id, db)
+
+
+@router.post("/", response_model=DeviceResponse)
+def create_device(
+    data: DeviceCreate,
+    db: Session = Depends(get_db),
+):
+    group = (
+        db.query(DeviceGroup)
+        .filter(DeviceGroup.group_id == data.group_id)
+        .first()
+    )
+
+    if not group:
+        raise api_exception(
+            404,
+            "DEVICE_GROUP_NOT_FOUND",
+            "Device group not found",
+        )
+
+    existing_device = (
+        db.query(Device)
+        .filter(
+            (Device.device_code == data.device_code)
+            | (Device.ip_address == data.ip_address)
+        )
+        .first()
+    )
+
+    if existing_device:
+        raise api_exception(
+            400,
+            "DEVICE_ALREADY_EXISTS",
+            "Device code or IP address already exists",
+        )
+
+    if data.ssh_password and not data.ssh_username:
+        raise api_exception(
+            400,
+            "SSH_USERNAME_REQUIRED",
+            "ssh_username is required when ssh_password is provided",
+        )
+    if data.ssh_username and not data.ssh_password:
+        raise api_exception(
+            400,
+            "SSH_PASSWORD_REQUIRED",
+            "ssh_password is required when ssh_username is provided",
+        )
+
+    now = now_local()
+    new_device = Device(
+        group_id=data.group_id,
+        device_code=data.device_code,
+        device_name=data.device_name,
+        ip_address=data.ip_address,
+        device_status=data.device_status,
+        auto_backup_enabled=data.auto_backup_enabled,
+        last_seen_at=data.last_seen_at,
+        ssh_username=data.ssh_username or None,
+        ssh_password_encrypted=encrypt_secret(data.ssh_password) if data.ssh_password else None,
+        ssh_port=data.ssh_port,
+        created_at=now,
+        updated_at=now,
+    )
+
+    db.add(new_device)
+    db.commit()
+    db.refresh(new_device)
+
+    return new_device
+
+
+@router.put("/{device_id}", response_model=DeviceResponse)
+def update_device(
+    device_id: int,
+    data: DeviceUpdate,
+    db: Session = Depends(get_db),
+):
+    device = (
+        db.query(Device)
+        .filter(Device.device_id == device_id)
+        .first()
+    )
+
+    if not device:
+        raise api_exception(
+            404,
+            "DEVICE_NOT_FOUND",
+            "Device not found",
+        )
+
+    update_data = {
+        field: value
+        for field, value in data.model_dump(exclude_unset=True).items()
+        if value is not None and value != ""
+    }
+
+    clear_ssh_override = update_data.pop("clear_ssh_override", False)
+
+    if "ssh_password" in update_data:
+        update_data["ssh_password_encrypted"] = encrypt_secret(update_data.pop("ssh_password"))
+
+    if "group_id" in update_data:
+        group = (
+            db.query(DeviceGroup)
+            .filter(DeviceGroup.group_id == update_data["group_id"])
+            .first()
+        )
+        if not group:
+            raise api_exception(
+                404,
+                "DEVICE_GROUP_NOT_FOUND",
+                "Device group not found",
+            )
+
+    if "device_code" in update_data:
+        existing_device = (
+            db.query(Device)
+            .filter(
+                Device.device_code == update_data["device_code"],
+                Device.device_id != device_id,
+            )
+            .first()
+        )
+        if existing_device:
+            raise api_exception(
+                400,
+                "DEVICE_CODE_ALREADY_EXISTS",
+                "Device code already exists",
+            )
+
+    if "ip_address" in update_data:
+        existing_device = (
+            db.query(Device)
+            .filter(
+                Device.ip_address == update_data["ip_address"],
+                Device.device_id != device_id,
+            )
+            .first()
+        )
+        if existing_device:
+            raise api_exception(
+                400,
+                "IP_ADDRESS_ALREADY_EXISTS",
+                "IP address already exists",
+            )
+
+    for field, value in update_data.items():
+        setattr(device, field, value)
+
+    if clear_ssh_override:
+        device.ssh_username = None
+        device.ssh_password_encrypted = None
+        device.ssh_port = None
+
+    device.updated_at = now_local()
+
+    db.commit()
+    db.refresh(device)
+
+    return device
+
+
+@router.get("/{device_id}/paths", response_model=List[DeviceBackupPathResponse])
+def list_device_backup_paths(
+    device_id: int,
+    db: Session = Depends(get_db),
+):
+    """แสดง path สำรองข้อมูลเฉพาะเครื่องนี้ (แยกจาก path กลางของฟลีต)"""
+    _get_device_or_404(device_id, db)
+    return [
+        DeviceBackupPathResponse(path=target.path, label=target.label)
+        for target in get_device_backup_paths(db, device_id)
+    ]
+
+
+@router.post("/{device_id}/paths", response_model=DeviceBackupPathResponse)
+def add_device_backup_path_endpoint(
+    device_id: int,
+    data: DeviceBackupPathCreate,
+    db: Session = Depends(get_db),
+):
+    """เพิ่ม path สำรองข้อมูลเฉพาะเครื่องนี้ — เมื่อเครื่องนี้มี path ของตัวเองแล้ว
+    ระบบจะสำรองข้อมูลตาม path เหล่านี้เท่านั้น ไม่ใช้ path กลางของฟลีตอีกต่อไป"""
+    _get_device_or_404(device_id, db)
+    try:
+        target = add_device_backup_path(db, device_id, data.path, data.label)
+    except ValueError as exc:
+        raise api_exception(400, "INVALID_BACKUP_PATH", str(exc))
+
+    return DeviceBackupPathResponse(path=target.path, label=target.label)
+
+
+@router.delete("/{device_id}/paths", response_model=DeviceBackupPathResponse)
+def delete_device_backup_path_endpoint(
+    device_id: int,
+    path: str,
+    db: Session = Depends(get_db),
+):
+    """ลบ path สำรองข้อมูลเฉพาะเครื่องนี้"""
+    _get_device_or_404(device_id, db)
+    try:
+        deleted = delete_device_backup_path(db, device_id, path)
+    except ValueError as exc:
+        raise api_exception(400, "INVALID_BACKUP_PATH", str(exc))
+
+    if not deleted:
+        raise api_exception(404, "DEVICE_BACKUP_PATH_NOT_FOUND", "Device backup path not found")
+
+    return DeviceBackupPathResponse(path=path, label="")
+
+
+@router.delete("/{device_id}")
+def delete_device(
+    device_id: int,
+    db: Session = Depends(get_db),
+):
+    device = (
+        db.query(Device)
+        .filter(Device.device_id == device_id)
+        .first()
+    )
+
+    if not device:
+        raise api_exception(
+            404,
+            "DEVICE_NOT_FOUND",
+            "Device not found",
+        )
+
+    db.delete(device)
+    db.commit()
+
+    return {
+        "message": "Device deleted successfully",
+    }
+
+def _refresh_devices_statuses(devices: List[Device], db: Session) -> None:
+    if not devices:
+        return
+
+    max_workers = max(1, min(int(os.getenv("DEVICE_STATUS_WORKERS", "16")), len(devices)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        statuses = list(executor.map(lambda device: (device.device_id, _can_connect(device.ip_address, getattr(device, "ssh_port", None))), devices))
+
+    now = now_local()
+    status_by_id = dict(statuses)
+    for device in devices:
+        online = status_by_id.get(device.device_id, False)
+        device.device_status = (
+            constants.DEVICE_STATUS_ONLINE
+            if online
+            else constants.DEVICE_STATUS_OFFLINE
+        )
+        if online:
+            device.last_seen_at = now
+        device.updated_at = now
+
+    db.commit()
+    for device in devices:
+        db.refresh(device)
+
+
+def _can_connect(ip_address: str, port: Optional[int] = None) -> bool:
+    if os.getenv("MOCK_MODE", "true").strip().lower() in ("true", "1", "yes"):
+        try:
+            last = int(ip_address.split(".")[-1])
+            if last in (102, 105, 106, 8):
+                return False
+        except Exception:
+            pass
+        return True
+
+    if port is None:
+        port = int(os.getenv("ROBOT_SSH_PORT", "22"))
+    timeout = float(os.getenv("DEVICE_STATUS_TIMEOUT_SECONDS", "1.5"))
+    try:
+        with socket.create_connection((ip_address, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _get_device_or_404(device_id: int, db: Session) -> Device:
+    device = (
+        db.query(Device)
+        .filter(Device.device_id == device_id)
+        .first()
+    )
+    if not device:
+        raise api_exception(
+            404,
+            "DEVICE_NOT_FOUND",
+            "Device not found",
+        )
+    return device
+
+
+def _default_browse_paths(db: Session, device_id: Optional[int] = None) -> List[str]:
+    if device_id is not None:
+        device_paths = get_device_backup_paths(db, device_id)
+        if device_paths:
+            return [target.path for target in device_paths]
+
+    return [
+        path
+        for path in (
+            os.getenv("ROBOT_NODE_RED_FLOW_PATH"),
+            os.getenv("ROBOT_MAPS_PATH"),
+        )
+        if path
+    ]
+
+
+def _backup_target_type_from_path(path: str) -> str:
+    normalized_path = path.rstrip("/")
+    if path.endswith("/"):
+        return "directory"
+    return "file" if os.path.splitext(os.path.basename(normalized_path))[1] else "directory"

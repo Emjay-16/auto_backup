@@ -1,0 +1,87 @@
+.badge,
+.avatar {
+  --group-main: var(--muted);
+  --group-soft: var(--surface-soft);
+  --group-line: var(--line);
+  --group-shadow: rgba(19, 32, 43, 0.07);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid var(--group-line);
+  background: var(--group-soft);
+  color: var(--group-main);
+  font-weight: 760;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.badge {
+  min-height: 24px;
+  gap: 6px;
+  padding: 0 10px 0 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
+}
+
+.avatar {
+  width: 50px;
+  height: 50px;
+  flex-direction: column;
+  gap: 4px;
+  border-radius: 15px;
+  font-size: 12px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.9),
+    0 14px 26px var(--group-shadow);
+}
+
+.badge i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--group-main);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--group-main) 14%, transparent);
+}
+
+.avatar i {
+  width: 18px;
+  height: 3px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--group-main) 32%, #ffffff);
+}
+
+.badge b,
+.avatar b {
+  font: inherit;
+}
+
+.amr {
+  --group-main: var(--primary);
+  --group-soft: #e4f3fc;
+  --group-line: #bbe1fa;
+  --group-shadow: rgba(50, 130, 184, 0.14);
+}
+
+.smr {
+  --group-main: var(--success);
+  --group-soft: #e2f4f1;
+  --group-line: #a8d8d1;
+  --group-shadow: rgba(7, 128, 109, 0.14);
+}
+
+.smrl {
+  --group-main: #526fa3;
+  --group-soft: #e7eef7;
+  --group-line: #bed0e8;
+  --group-shadow: rgba(82, 111, 163, 0.14);
+}
+
+.defaultTone {
+  --group-main: var(--muted);
+  --group-soft: var(--surface-soft);
+  --group-line: var(--line);
+  --group-shadow: rgba(100, 118, 135, 0.12);
+}

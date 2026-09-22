@@ -1,0 +1,603 @@
+import errno
+import hashlib
+import os
+import posixpath
+import shlex
+import shutil
+import stat
+import uuid
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+from api.utils.time import now_local
+
+
+class RemotePathNotFound(RuntimeError):
+    def __init__(self, remote_path: str):
+        self.remote_path = remote_path
+        super().__init__(f"Remote path not found: {remote_path}")
+
+
+@dataclass
+class DownloadedFile:
+    file_name: str
+    local_path: str
+    remote_path: str
+    file_size_mb: float
+    checksum: str
+
+
+@dataclass
+class RemotePathSnapshot:
+    remote_path: str
+    is_directory: bool
+    size_bytes: int
+    modified_at: datetime
+    checksum: str
+
+
+@dataclass
+class RemoteFileItem:
+    name: str
+    path: str
+    file_type: str
+    size_bytes: Optional[int]
+    modified_at: datetime
+
+
+def _is_mock() -> bool:
+    return os.getenv("MOCK_MODE", "true").strip().lower() in ("true", "1", "yes")
+
+
+def list_remote_path(
+    host: str,
+    username: str,
+    password: str,
+    remote_path: str,
+    port: int = 22,
+) -> List[RemoteFileItem]:
+    if _is_mock():
+        now = now_local()
+        clean = remote_path.rstrip("/\\")
+        if clean.endswith("maps") or "maps" in clean:
+            return [
+                RemoteFileItem(name="floor_01.yaml", path=f"{clean}/floor_01.yaml", file_type="yaml", size_bytes=1024, modified_at=now),
+                RemoteFileItem(name="floor_01.pgm", path=f"{clean}/floor_01.pgm", file_type="pgm", size_bytes=1048576, modified_at=now),
+                RemoteFileItem(name="nav_points.json", path=f"{clean}/nav_points.json", file_type="json", size_bytes=2048, modified_at=now),
+            ]
+        if "." in posixpath.basename(clean):
+            name = posixpath.basename(clean)
+            ext = name.split(".")[-1]
+            return [RemoteFileItem(name=name, path=clean, file_type=ext, size_bytes=4096, modified_at=now)]
+
+        return [
+            RemoteFileItem(name="flows.json", path=f"{clean}/flows.json", file_type="json", size_bytes=12288, modified_at=now),
+            RemoteFileItem(name="maps", path=f"{clean}/maps", file_type="directory", size_bytes=None, modified_at=now),
+            RemoteFileItem(name="settings.json", path=f"{clean}/settings.json", file_type="json", size_bytes=2048, modified_at=now),
+            RemoteFileItem(name="config.ini", path=f"{clean}/config.ini", file_type="ini", size_bytes=1024, modified_at=now),
+        ]
+
+    try:
+        import paramiko
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Missing dependency: install paramiko") from exc
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        ssh.connect(
+            hostname=host,
+            port=port,
+            username=username,
+            password=password,
+            timeout=10,
+        )
+
+        with ssh.open_sftp() as sftp:
+            _configure_sftp_timeout(sftp)
+            return _list_remote_path(sftp, remote_path)
+    finally:
+        ssh.close()
+
+
+def download_paths(
+    host: str,
+    username: str,
+    password: str,
+    remote_paths: List[str],
+    local_root: Path,
+    port: int = 22,
+) -> List[DownloadedFile]:
+    if _is_mock():
+        local_root.mkdir(parents=True, exist_ok=True)
+        downloaded: List[DownloadedFile] = []
+        now = now_local()
+        for remote_path in remote_paths:
+            remote_name = posixpath.basename(remote_path.rstrip("/\\")) or "root"
+            dest_target = local_root / remote_name
+            if remote_path.endswith("/") or ("." not in remote_name):
+                dest_target.mkdir(parents=True, exist_ok=True)
+                sample_file = dest_target / "floor_01.yaml"
+                content = b"image: floor_01.pgm\nresolution: 0.05\norigin: [-10.0, -10.0, 0.0]\n"
+                sample_file.write_bytes(content)
+                sha = hashlib.sha256(content).hexdigest()
+                downloaded.append(
+                    DownloadedFile(
+                        file_name="floor_01.yaml",
+                        local_path=str(sample_file),
+                        remote_path=f"{remote_path.rstrip('/')}/floor_01.yaml",
+                        file_size_mb=round(len(content) / (1024 * 1024), 4),
+                        checksum=sha,
+                    )
+                )
+            else:
+                dest_target.parent.mkdir(parents=True, exist_ok=True)
+                if remote_name.endswith(".json"):
+                    content = b'{\n  "version": "1.0",\n  "flows": [{"id": "node_1", "type": "function", "name": "Mock Flow"}]\n}\n'
+                else:
+                    content = f"Mock data for {remote_name} at {now.isoformat()}\n".encode("utf-8")
+                dest_target.write_bytes(content)
+                sha = hashlib.sha256(content).hexdigest()
+                downloaded.append(
+                    DownloadedFile(
+                        file_name=remote_name,
+                        local_path=str(dest_target),
+                        remote_path=remote_path,
+                        file_size_mb=round(len(content) / (1024 * 1024), 4),
+                        checksum=sha,
+                    )
+                )
+        return downloaded
+
+    try:
+        import paramiko
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Missing dependency: install paramiko") from exc
+
+    local_root.mkdir(parents=True, exist_ok=True)
+    downloaded_files: List[DownloadedFile] = []
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        ssh.connect(
+            hostname=host,
+            port=port,
+            username=username,
+            password=password,
+            timeout=10,
+        )
+
+        with ssh.open_sftp() as sftp:
+            _configure_sftp_timeout(sftp)
+            for remote_path in remote_paths:
+                remote_name = posixpath.basename(remote_path.rstrip("/\\")) or "root"
+                _download_path(sftp, remote_path, local_root / remote_name, downloaded_files)
+    finally:
+        ssh.close()
+
+    return downloaded_files
+
+
+def _upload_single_file_with_fallback(
+    ssh,
+    sftp,
+    local_path: Path,
+    remote_path: str,
+    password: str,
+) -> None:
+    remote_path = remote_path.replace("\\", "/")
+    remote_dir = posixpath.dirname(remote_path)
+
+    # If remote_path is an existing directory on target, append the local filename
+    try:
+        remote_stat = sftp.stat(remote_path)
+        if stat.S_ISDIR(remote_stat.st_mode):
+            remote_path = posixpath.join(remote_path, local_path.name)
+            remote_dir = posixpath.dirname(remote_path)
+    except OSError:
+        pass
+
+    # 1. First attempt: standard SFTP put
+    try:
+        _ensure_remote_directory(sftp, remote_dir)
+        sftp.put(str(local_path), remote_path)
+        return
+    except Exception as exc:
+        error_msg = str(exc).lower()
+        is_permission_error = (
+            "permission denied" in error_msg
+            or getattr(exc, "errno", None) in (errno.EACCES, errno.EPERM)
+        )
+        if not is_permission_error or not password:
+            raise RuntimeError(f"Failed to upload '{local_path.name}' to '{remote_path}': {exc}") from exc
+
+    # 2. Fallback attempt: upload to /tmp where matrix user has write access, then sudo cp to destination
+    temp_remote_file = f"/tmp/restore_{uuid.uuid4().hex[:12]}_{local_path.name}"
+    try:
+        sftp.put(str(local_path), temp_remote_file)
+    except Exception as tmp_exc:
+        raise RuntimeError(f"SFTP failed to write temp file for '{remote_path}': {tmp_exc}") from tmp_exc
+
+    cmd = (
+        f"echo {shlex.quote(password)} | sudo -S mkdir -p {shlex.quote(remote_dir)} && "
+        f"echo {shlex.quote(password)} | sudo -S cp {shlex.quote(temp_remote_file)} {shlex.quote(remote_path)} && "
+        f"rm -f {shlex.quote(temp_remote_file)}"
+    )
+    try:
+        stdin, stdout, stderr = ssh.exec_command(cmd, timeout=60)
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status != 0:
+            err = stderr.read().decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Failed to write to '{remote_path}' (sudo fallback failed: {err})")
+    finally:
+        try:
+            sftp.remove(temp_remote_file)
+        except Exception:
+            pass
+
+
+def upload_files(
+    host: str,
+    username: str,
+    password: str,
+    local_paths: List[Path],
+    remote_root: str,
+    port: int = 22,
+) -> None:
+    if _is_mock():
+        return
+
+    try:
+        import paramiko
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Missing dependency: install paramiko") from exc
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        ssh.connect(
+            hostname=host,
+            port=port,
+            username=username,
+            password=password,
+            timeout=10,
+        )
+
+        local_root = Path(os.path.commonpath([str(path) for path in local_paths]))
+        if local_root.is_file():
+            local_root = local_root.parent
+
+        with ssh.open_sftp() as sftp:
+            _configure_sftp_timeout(sftp)
+            for local_path in local_paths:
+                relative_path = local_path.relative_to(local_root).as_posix()
+                remote_path = posixpath.join(remote_root, relative_path)
+                _upload_single_file_with_fallback(
+                    ssh=ssh,
+                    sftp=sftp,
+                    local_path=local_path,
+                    remote_path=remote_path,
+                    password=password,
+                )
+    finally:
+        ssh.close()
+
+
+def upload_files_to_targets(
+    host: str,
+    username: str,
+    password: str,
+    transfers: List[Tuple[Path, str]],
+    port: int = 22,
+) -> None:
+    if _is_mock():
+        return
+
+    try:
+        import paramiko
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Missing dependency: install paramiko") from exc
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        ssh.connect(
+            hostname=host,
+            port=port,
+            username=username,
+            password=password,
+            timeout=10,
+        )
+
+        with ssh.open_sftp() as sftp:
+            _configure_sftp_timeout(sftp)
+            for local_path, remote_path in transfers:
+                _upload_single_file_with_fallback(
+                    ssh=ssh,
+                    sftp=sftp,
+                    local_path=local_path,
+                    remote_path=remote_path,
+                    password=password,
+                )
+    finally:
+        ssh.close()
+
+
+def snapshot_remote_path(
+    host: str,
+    username: str,
+    password: str,
+    remote_path: str,
+    port: int = 22,
+) -> RemotePathSnapshot:
+    if _is_mock():
+        clean = remote_path.rstrip("/\\")
+        is_dir = remote_path.endswith("/") or ("." not in posixpath.basename(clean))
+        return RemotePathSnapshot(
+            remote_path=remote_path,
+            is_directory=is_dir,
+            size_bytes=4096 if not is_dir else 10240,
+            modified_at=now_local(),
+            checksum=hashlib.sha256(f"mock-snapshot-{remote_path}".encode("utf-8")).hexdigest(),
+        )
+
+    try:
+        import paramiko
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Missing dependency: install paramiko") from exc
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        ssh.connect(
+            hostname=host,
+            port=port,
+            username=username,
+            password=password,
+            timeout=10,
+        )
+        with ssh.open_sftp() as sftp:
+            _configure_sftp_timeout(sftp)
+            return _snapshot_path(sftp, remote_path)
+    finally:
+        ssh.close()
+
+
+def snapshot_remote_path_metadata(
+    host: str,
+    username: str,
+    password: str,
+    remote_path: str,
+    port: int = 22,
+) -> RemotePathSnapshot:
+    if _is_mock():
+        clean = remote_path.rstrip("/\\")
+        is_dir = remote_path.endswith("/") or ("." not in posixpath.basename(clean))
+        return RemotePathSnapshot(
+            remote_path=remote_path,
+            is_directory=is_dir,
+            size_bytes=4096 if not is_dir else 10240,
+            modified_at=now_local(),
+            checksum="",
+        )
+
+    try:
+        import paramiko
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Missing dependency: install paramiko") from exc
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        ssh.connect(
+            hostname=host,
+            port=port,
+            username=username,
+            password=password,
+            timeout=10,
+        )
+        with ssh.open_sftp() as sftp:
+            _configure_sftp_timeout(sftp)
+            remote_stat = _stat_remote_path(sftp, remote_path)
+            return RemotePathSnapshot(
+                remote_path=remote_path,
+                is_directory=stat.S_ISDIR(remote_stat.st_mode),
+                size_bytes=remote_stat.st_size,
+                modified_at=datetime.fromtimestamp(remote_stat.st_mtime),
+                checksum="",
+            )
+    finally:
+        ssh.close()
+
+
+def create_zip_archive(source_path: Path, archive_name: str) -> DownloadedFile:
+    zip_base_path = source_path.parent / archive_name
+    zip_path = Path(shutil.make_archive(str(zip_base_path), "zip", source_path))
+    file_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+
+    return DownloadedFile(
+        file_name=zip_path.name,
+        local_path=str(zip_path),
+        remote_path=str(source_path),
+        file_size_mb=file_size_mb,
+        checksum=_sha256_file(zip_path),
+    )
+
+
+def _download_path(sftp, remote_path: str, local_path: Path, downloaded_files):
+    remote_stat = _stat_remote_path(sftp, remote_path)
+
+    if stat.S_ISDIR(remote_stat.st_mode):
+        local_path.mkdir(parents=True, exist_ok=True)
+        for item in sftp.listdir_attr(remote_path):
+            child_remote_path = posixpath.join(remote_path, item.filename)
+            child_local_path = local_path / item.filename
+            _download_path(sftp, child_remote_path, child_local_path, downloaded_files)
+        return
+
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    sftp.get(remote_path, str(local_path))
+
+    file_size_mb = os.path.getsize(local_path) / (1024 * 1024)
+    downloaded_files.append(
+        DownloadedFile(
+            file_name=local_path.name,
+            local_path=str(local_path),
+            remote_path=remote_path,
+            file_size_mb=file_size_mb,
+            checksum=_sha256_file(local_path),
+        )
+    )
+
+
+def _list_remote_path(sftp, remote_path: str) -> List[RemoteFileItem]:
+    remote_stat = _stat_remote_path(sftp, remote_path)
+    if not stat.S_ISDIR(remote_stat.st_mode):
+        return [_remote_file_item(remote_path, remote_stat)]
+
+    items = []
+    for item in sorted(sftp.listdir_attr(remote_path), key=lambda value: value.filename.lower()):
+        item_path = posixpath.join(remote_path, item.filename)
+        items.append(_remote_file_item(item_path, item))
+
+    return sorted(items, key=lambda value: (value.file_type != "directory", value.name.lower()))
+
+
+def _remote_file_item(remote_path: str, remote_stat) -> RemoteFileItem:
+    is_directory = stat.S_ISDIR(remote_stat.st_mode)
+    return RemoteFileItem(
+        name=posixpath.basename(remote_path.rstrip("/")) or remote_path,
+        path=remote_path,
+        file_type="directory" if is_directory else "file",
+        size_bytes=None if is_directory else remote_stat.st_size,
+        modified_at=datetime.fromtimestamp(remote_stat.st_mtime),
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _snapshot_path(sftp, remote_path: str) -> RemotePathSnapshot:
+    remote_stat = _stat_remote_path(sftp, remote_path)
+    modified_at = datetime.fromtimestamp(remote_stat.st_mtime)
+
+    if not stat.S_ISDIR(remote_stat.st_mode):
+        return RemotePathSnapshot(
+            remote_path=remote_path,
+            is_directory=False,
+            size_bytes=remote_stat.st_size,
+            modified_at=modified_at,
+            checksum=_sha256_remote_file(sftp, remote_path),
+        )
+
+    digest = hashlib.sha256()
+    total_size = 0
+    latest_mtime = remote_stat.st_mtime
+
+    for item in _walk_remote_files(sftp, remote_path):
+        relative_path, file_path, file_stat = item
+        total_size += file_stat.st_size
+        latest_mtime = max(latest_mtime, file_stat.st_mtime)
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(str(file_stat.st_size).encode("ascii"))
+        digest.update(_sha256_remote_file(sftp, file_path).encode("ascii"))
+
+    return RemotePathSnapshot(
+        remote_path=remote_path,
+        is_directory=True,
+        size_bytes=total_size,
+        modified_at=datetime.fromtimestamp(latest_mtime),
+        checksum=digest.hexdigest(),
+    )
+
+
+def _walk_remote_files(sftp, remote_root: str):
+    stack = [(remote_root, "")]
+    while stack:
+        current_path, relative_root = stack.pop()
+        for item in sorted(sftp.listdir_attr(current_path), key=lambda value: value.filename):
+            child_path = posixpath.join(current_path, item.filename)
+            relative_path = posixpath.join(relative_root, item.filename)
+            if stat.S_ISDIR(item.st_mode):
+                stack.append((child_path, relative_path))
+            else:
+                yield relative_path, child_path, item
+
+
+def _sha256_remote_file(sftp, remote_path: str) -> str:
+    digest = hashlib.sha256()
+    with sftp.open(remote_path, "rb") as remote_file:
+        for chunk in iter(lambda: remote_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _configure_sftp_timeout(sftp) -> None:
+    timeout = float(os.getenv("SFTP_READ_TIMEOUT_SECONDS", "30"))
+    sftp.get_channel().settimeout(max(timeout, 1))
+
+
+def _stat_remote_path(sftp, remote_path: str):
+    try:
+        return sftp.stat(remote_path)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ENOENT or "No such file" in str(exc):
+            raise RemotePathNotFound(remote_path) from exc
+        raise
+
+
+def _ensure_remote_directory(sftp, remote_path: str) -> None:
+    remote_path = remote_path.replace("\\", "/")
+    if not remote_path or remote_path in (".", "/"):
+        return
+
+    parts = [part for part in remote_path.strip("/").split("/") if part]
+    if not parts:
+        return
+
+    current = ""
+    for index, part in enumerate(parts):
+        if index == 0 and part.endswith(":"):
+            current = part
+            continue
+
+        if current:
+            current = f"{current}/{part}"
+        elif remote_path.startswith("/"):
+            current = f"/{part}"
+        else:
+            current = part
+
+        try:
+            sftp.stat(current)
+        except OSError:
+            sftp.mkdir(current)
+
+
+def build_backup_directory(base_path: str, device_name: str) -> Path:
+    timestamp = now_local().strftime("%Y%m%d_%H%M%S_%f")
+    safe_device_name = device_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    backup_directory = Path(base_path) / safe_device_name / timestamp
+    if not backup_directory.exists():
+        return backup_directory
+
+    for index in range(1, 1000):
+        candidate = backup_directory.with_name(f"{backup_directory.name}_{index}")
+        if not candidate.exists():
+            return candidate
+
+    raise RuntimeError("Unable to create unique backup directory")

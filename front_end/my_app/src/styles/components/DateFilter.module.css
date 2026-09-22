@@ -1,0 +1,125 @@
+.dateFilter {
+  width: fit-content;
+  max-width: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px 8px 8px;
+  border: 1px solid rgba(147, 197, 253, 0.9);
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.97), rgba(244, 249, 255, 0.96));
+  box-shadow: 0 10px 24px rgba(30, 64, 175, 0.08);
+}
+
+.dateText {
+  display: grid;
+  gap: 2px;
+  padding: 0 4px 0 8px;
+}
+
+.dateFilter span {
+  color: #49657d;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.dateFilter small {
+  color: #7387a0;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.dateInputGroup {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dateInputGroup input[type="text"] {
+  width: 132px;
+  min-height: 38px;
+  padding: 0 12px;
+  border: 1px solid #d8e6f2;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #ffffff, #f7fbff);
+  color: var(--foreground);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.dateInputGroup input[type="text"]:focus {
+  border-color: rgba(59, 130, 246, 0.8);
+  box-shadow: 0 0 0 4px rgba(147, 197, 253, 0.35);
+  transform: translateY(-1px);
+}
+
+.dateInputGroup button {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #bfdaf4;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #f0f8ff, #e4f1fe);
+  color: #1d4f91;
+  font: inherit;
+  font-size: 16px;
+  font-weight: 900;
+  cursor: pointer;
+  transition: transform 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.dateInputGroup button svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+
+.dateInputGroup button:hover {
+  transform: translateY(-1px);
+  border-color: rgba(59, 130, 246, 0.8);
+  background: linear-gradient(180deg, #ebf7ff, #dfeefb);
+}
+
+.dateInputGroup button:active {
+  transform: translateY(0);
+}
+
+.nativeDateInput {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+@media (max-width: 640px) {
+  .dateFilter {
+    width: 100%;
+    justify-content: space-between;
+    flex-wrap: wrap;
+  }
+
+  .dateText {
+    width: 100%;
+  }
+
+  .dateInputGroup {
+    width: 100%;
+  }
+
+  .dateInputGroup input[type="text"] {
+    flex: 1;
+    width: auto;
+  }
+}
